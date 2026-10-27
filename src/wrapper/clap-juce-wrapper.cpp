@@ -2124,31 +2124,39 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
             return {};
         }
 
-        juce::Rectangle<int> convertToHostBounds(juce::Rectangle<int> pluginRect)
+        // A host's size held to the editor's limits and aspect in its units, at the scale a
+        // set_size reads it at, answered as those units' pixels: a size at the aspect that is some
+        // units' pixels comes back unchanged, where pixel arithmetic answers 1921 for 1920x1238.
+        juce::Rectangle<int> constrainHostSize(juce::Rectangle<int> hostBounds) const
         {
-            const auto desktopScale = clapWrapper.guiScaleFactor;
-            if (juce::isWithin(desktopScale, 1.0f, 1.0e-3f))
-                return pluginRect;
+            auto *constrainer = editor->getConstrainer();
+            if (constrainer == nullptr)
+                return hostBounds;
 
-            return {juce::roundToInt((float)pluginRect.getX() * desktopScale),
-                    juce::roundToInt((float)pluginRect.getY() * desktopScale),
-                    juce::roundToInt((float)pluginRect.getWidth() * desktopScale),
-                    juce::roundToInt((float)pluginRect.getHeight() * desktopScale)};
+            return constrainHostSize(hostBounds, *constrainer);
+        }
+
+        // The scale a host's size is read at: on Windows, once attached, the window's DPI, which a
+        // set_size takes first (takeHostSize).
+        float hostSizeScale() const
+        {
+#if JUCE_WINDOWS && JUCE_VERSION >= 0x090000
+            if (const auto scale = windowScale())
+                return *scale;
+#endif
+            return clapWrapper.guiScaleFactor;
         }
 
         void resizeHostWindow()
         {
             if (editor != nullptr)
             {
-                auto editorBounds = getSizeToContainChild().withPosition(0, 0);
-                {
-                    const juce::ScopedValueSetter<bool> resizingParentSetter(resizingParent, true);
-                    if (host.canUseGui())
-                        host.guiRequestResize((uint32_t)editorBounds.getWidth(),
-                                              (uint32_t)editorBounds.getHeight());
-                }
-
-                setBounds(editorBounds.withPosition(0, 0));
+                askHostToFit(getSizeToContainChild());
+                containEditor();
+#if JUCE_WINDOWS && JUCE_VERSION >= 0x090000
+                // The host has been asked for another size since.
+                heldHostSize.reset();
+#endif
             }
         }
 
@@ -2156,21 +2164,114 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
         {
             if (editor != nullptr)
             {
-                auto prevEditorBounds = editor->getLocalArea(this, lastBounds);
-
-                {
-                    const juce::ScopedValueSetter<bool> resizingChildSetter{resizingChild, true};
-
-                    editor->setScaleFactor(scale);
-                    editor->setBounds(prevEditorBounds.withPosition(0, 0));
-                }
-
-                lastBounds = getSizeToContainChild();
-
+                scaleEditor(scale);
+#if JUCE_WINDOWS && JUCE_VERSION >= 0x090000
+                // A size the host set before attach is its window's, in pixels no scale changes:
+                // nothing to ask, and attach reads it at the window's DPI.
+                if (heldHostSize.has_value())
+                    return;
+#endif
                 resizeHostWindow();
                 repaint();
             }
         }
+
+#if JUCE_WINDOWS && JUCE_VERSION >= 0x090000
+        // The peer is pinned at 1.0, so the editor's transform carries the display's scale, which
+        // the window it is attached to knows: a host's set_scale may disagree (FL Studio passes
+        // 1.25 on a 144-DPI window). A size the host set before attach is read at that DPI;
+        // otherwise the host is asked to fit the editor at it. Checked every 500 ms after, for a
+        // move to a display of another scale or a host that refused, unless it cannot be asked.
+        void followWindowScale(HWND window)
+        {
+            hostWindow = window;
+            if (const auto held = std::exchange(heldHostSize, std::nullopt))
+                takeHeldHostSize(*held);
+            else
+                applyWindowScale();
+
+            if (canAskHost())
+                windowScaleCheck.startTimer(500);
+        }
+
+        // The window's scale is taken only once the host accepts the editor's size at it, worked
+        // out without scaling the editor: refused, the editor keeps its old scale and size, and the
+        // next check asks again.
+        void applyWindowScale()
+        {
+            const auto scale = windowScale();
+            if (editor == nullptr || !scale.has_value() ||
+                juce::approximatelyEqual(*scale, clapWrapper.guiScaleFactor))
+                return;
+
+            const auto toPixels = juce::AffineTransform::scale(*scale);
+            if (!askHostToFit(pixelsOf(editor->getLocalBounds(), toPixels)))
+                return;
+
+            scaleEditor(*scale);
+            containEditor();
+            repaint();
+        }
+
+        // A size the host hands in is its window's, read at that window's DPI, taken first and
+        // without asking a resize: the host may have moved the window since the last check. Within
+        // the wrapper's own request (askHostToFit) the editor keeps the size it asked for.
+        void takeHostSize(juce::Rectangle<int> hostBounds)
+        {
+            if (editor == nullptr || resizingParent)
+                return;
+
+            const auto scale = windowScale();
+            if (scale.has_value() && !juce::approximatelyEqual(*scale, clapWrapper.guiScaleFactor))
+                scaleEditor(*scale);
+
+            fitEditorTo(hostBounds);
+            const juce::ScopedValueSetter<bool> resizingParentSetter(resizingParent, true);
+            setBounds(hostBounds);
+        }
+
+        // Before attach there is no window to read a host's size at: it is held in pixels, which
+        // get_size answers, until attach (followWindowScale). One that only echoes the editor's own
+        // size, as get_size answered it, is no size the host kept.
+        void holdHostSize(juce::Rectangle<int> hostBounds)
+        {
+            if (hostBounds == getSizeToContainChild().withZeroOrigin())
+            {
+                heldHostSize.reset();
+                containEditor();
+                return;
+            }
+
+            heldHostSize = hostBounds;
+            const juce::ScopedValueSetter<bool> resizingParentSetter(resizingParent, true);
+            setBounds(hostBounds);
+        }
+
+        // A held size is held to the editor's smallest size and aspect at the window's DPI: one
+        // they change is asked of the host once, and where it refuses, its window's size is taken
+        // as it is, so the attach draws the editor no larger than that window.
+        void takeHeldHostSize(juce::Rectangle<int> held)
+        {
+            const auto allowed = constrainHeldSize(held);
+            takeHostSize(allowed != held && askHostToFit(allowed) ? allowed : held);
+        }
+
+        // Not to the editor's largest size, which an editor may work out from its display's room:
+        // the wrapper is still invisible at attach, so that room may be another display's, and a
+        // size the host kept would come back cut to it.
+        juce::Rectangle<int> constrainHeldSize(juce::Rectangle<int> held) const
+        {
+            const auto *constrainer = editor->getConstrainer();
+            if (constrainer == nullptr)
+                return held;
+
+            juce::ComponentBoundsConstrainer smallestAndAspect;
+            smallestAndAspect.setMinimumWidth(constrainer->getMinimumWidth());
+            smallestAndAspect.setMinimumHeight(constrainer->getMinimumHeight());
+            smallestAndAspect.setFixedAspectRatio(constrainer->getFixedAspectRatio());
+            return constrainHostSize(held, smallestAndAspect);
+        }
+#endif
 
         void paint(juce::Graphics &g) override { g.fillAll(juce::Colours::red); }
         void resized() override
@@ -2178,17 +2279,7 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
             if (editor != nullptr)
             {
                 if (!resizingParent)
-                {
-                    auto newBounds = getLocalBounds();
-
-                    {
-                        const juce::ScopedValueSetter<bool> resizingChildSetter{resizingChild,
-                                                                                true};
-                        editor->setBounds(editor->getLocalArea(this, newBounds).withPosition(0, 0));
-                    }
-
-                    lastBounds = newBounds;
-                }
+                    fitEditorTo(getLocalBounds());
             }
         }
 
@@ -2217,10 +2308,135 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
 #endif
 
       private:
+        // A host whose clap_host_gui has request_resize still resizes its window when asked, so it
+        // is asked whatever else the extension lacks, which HostProxy's canUseGui() refuses; one
+        // without it cannot be asked, so it is answered as one that refuses.
+        bool canAskHost() const { return hostGui != nullptr && hostGui->request_resize != nullptr; }
+
+        bool askHostToFit(juce::Rectangle<int> bounds)
+        {
+            if (!canAskHost())
+                return false;
+
+            const juce::ScopedValueSetter<bool> resizingParentSetter(resizingParent, true);
+            return hostGui->request_resize(host.host(), (uint32_t)bounds.getWidth(),
+                                           (uint32_t)bounds.getHeight());
+        }
+
+        static const clap_host_gui *guiOf(HostType &proxy)
+        {
+            const clap_host_gui *gui = nullptr;
+            proxy.getExtension(gui, CLAP_EXT_GUI);
+            return gui;
+        }
+
+        // Sized to contain the editor, the wrapper leaves its units alone (resized()): its
+        // outward-rounded pixels read back would grow the editor a unit (825 units are 1032 px at
+        // 1.25, read back as 826).
+        void containEditor()
+        {
+            const juce::ScopedValueSetter<bool> resizingParentSetter(resizingParent, true);
+            setBounds(getSizeToContainChild().withPosition(0, 0));
+        }
+
+        // The editor keeps its own units at a new scale, never the wrapper's size read back.
+        void scaleEditor(float scale)
+        {
+            clapWrapper.guiScaleFactor = scale;
+            {
+                const juce::ScopedValueSetter<bool> resizingChildSetter{resizingChild, true};
+                editor->setScaleFactor(scale);
+            }
+            lastBounds = getSizeToContainChild();
+        }
+
+        void fitEditorTo(juce::Rectangle<int> hostBounds)
+        {
+            {
+                const juce::ScopedValueSetter<bool> resizingChildSetter{resizingChild, true};
+                editor->setBounds(unitsOf(hostBounds, editor->getTransform()));
+            }
+            lastBounds = hostBounds;
+        }
+
+        // The pixels the editor's units cover through `toPixels`, rounded outward as JUCE rounds
+        // the editor's bounds into the wrapper's (getSizeToContainChild).
+        static juce::Rectangle<int> pixelsOf(juce::Rectangle<int> units,
+                                             const juce::AffineTransform &toPixels)
+        {
+            return units.withZeroOrigin().transformedBy(toPixels);
+        }
+
+        // A host's size that is some units' outward-rounded pixels reads back as those units, so an
+        // echo or a size the host kept never grows the editor; any other size is covered, as JUCE
+        // converts it.
+        static juce::Rectangle<int> unitsOf(juce::Rectangle<int> hostBounds,
+                                            const juce::AffineTransform &toPixels)
+        {
+            const auto covering = hostBounds.withZeroOrigin().transformedBy(toPixels.inverted());
+            return covering.withSize(
+                unitsFor(hostBounds.getWidth(), covering.getWidth(), toPixels),
+                unitsFor(hostBounds.getHeight(), covering.getHeight(), toPixels));
+        }
+
+        static int unitsFor(int pixels, int coveringUnits, const juce::AffineTransform &toPixels)
+        {
+            const auto pixelsOfUnits = [&toPixels](int units) {
+                return pixelsOf({units, units}, toPixels).getWidth();
+            };
+            if (pixelsOfUnits(coveringUnits) != pixels &&
+                pixelsOfUnits(coveringUnits - 1) == pixels)
+                return coveringUnits - 1;
+
+            return coveringUnits;
+        }
+
+        juce::Rectangle<int> constrainHostSize(juce::Rectangle<int> hostBounds,
+                                               juce::ComponentBoundsConstrainer &constrainer) const
+        {
+            const auto toPixels = juce::AffineTransform::scale(hostSizeScale());
+            return pixelsOf(constrainUnits(constrainer, unitsOf(hostBounds, toPixels)), toPixels);
+        }
+
+        // A size already at the aspect is kept whichever side its rounding came from (the editor's
+        // own sizes round the height from the width); any other is fitted with its height leading,
+        // as upstream fits it, so a drag of the window's bottom edge resizes the editor.
+        static juce::Rectangle<int> constrainUnits(juce::ComponentBoundsConstrainer &constrainer,
+                                                   juce::Rectangle<int> units)
+        {
+            // JUCE's never-binding limits, as its AUv3 wrapper passes them, (max) past windows.h's
+            // macro: held to {}, a constrainer's bottom on-screen amount can collapse the size.
+            const auto maxLimits = (std::numeric_limits<int>::max)() / 2;
+            const juce::Rectangle<int> neverBinding{maxLimits, maxLimits};
+            const auto fitted = [&constrainer, &neverBinding, units](bool heightLeads) {
+                auto bounds = units;
+                constrainer.checkBounds(bounds, units, neverBinding, false, false, heightLeads,
+                                        !heightLeads);
+                return bounds;
+            };
+            return fitted(false) == units ? units : fitted(true);
+        }
+
         juce::Rectangle<int> lastBounds;
         bool resizingChild = false, resizingParent = false;
+        const clap_host_gui *const hostGui = guiOf(host);
 #if JUCE_WINDOWS && JUCE_VERSION >= 0x070006
         juce::detail::WindowsHooks hooks;
+#endif
+#if JUCE_WINDOWS && JUCE_VERSION >= 0x090000
+        // None before attach and once the window is gone (GetDpiForWindow gives 0).
+        std::optional<float> windowScale() const
+        {
+            const auto dpi = GetDpiForWindow(hostWindow);
+            if (dpi == 0)
+                return std::nullopt;
+
+            return static_cast<float>(dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI);
+        }
+
+        HWND hostWindow = nullptr;
+        std::optional<juce::Rectangle<int>> heldHostSize;
+        juce::TimedCallback windowScaleCheck{[this] { applyWindowScale(); }};
 #endif
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(EditorWrapperComponent)
     };
@@ -2292,6 +2508,15 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
 
     bool guiSetScale(double scale) noexcept override
     {
+#if JUCE_WINDOWS && JUCE_VERSION >= 0x090000
+        // Attached, the editor follows its window's DPI (followWindowScale), as CLAP lets a plugin
+        // that reads the scale from the OS ignore the host's: the call only prompts a check of it.
+        if (guiParentAttached && editorWrapper != nullptr)
+        {
+            editorWrapper->applyWindowScale();
+            return false;
+        }
+#endif
         if (scale > 50)
         {
             // this is almost definitely a units error
@@ -2321,47 +2546,18 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
         if (!editorWrapper->editor->isResizable())
             return false;
 
-        auto cst = editorWrapper->editor->getConstrainer();
+#if JUCE_WINDOWS && JUCE_VERSION >= 0x090000
+        // Before attach the limits' pixels are unknown: a size is held as it is, and read at the
+        // window's DPI and held to the limits at attach (guiSetSize).
+        if (!guiParentAttached)
+            return true;
+#endif
 
-        if (!cst)
-            return true; // we have no constraints. Whatever is fine!
-
-        const auto minBounds =
-            editorWrapper->convertToHostBounds({cst->getMinimumWidth(), cst->getMinimumHeight()});
-        const auto maxBounds =
-            editorWrapper->convertToHostBounds({cst->getMaximumWidth(), cst->getMaximumHeight()});
-        auto minW = (uint32_t)minBounds.getWidth();
-        auto maxW = (uint32_t)maxBounds.getWidth();
-        auto minH = (uint32_t)minBounds.getHeight();
-        auto maxH = (uint32_t)maxBounds.getHeight();
-
-        // There is no std::clamp in c++14
-        auto width = juce::jlimit(minW, maxW, *w);
-        auto height = juce::jlimit(minH, maxH, *h);
-
-        auto aspectRatio = (float)cst->getFixedAspectRatio();
-
-        if (aspectRatio > 0.0f)
-        {
-            /*
-             * This is obviously an unsatisfactory algorithm, but we wanted to have
-             * something at least workable here.
-             *
-             * The problem with other algorithms I tried is that this function gets
-             * called by BWS for sub-single pixel motions on macOS, so it is hard to make
-             * a version which is *stable* (namely adjust(w,h); cw=w;ch=h; adjust(cw,ch);
-             * cw == w; ch == h) that deals with directions. I tried all sorts of stuff
-             * and then ran into vacation.
-             *
-             * So for now here's this approach. See the discussion in CJE PR #67
-             * and interop-tracker issue #30.
-             */
-            width = (uint32_t)std::round(aspectRatio * (float)height);
-        }
-
-        *w = width;
-        *h = height;
-
+        // Stable at a scale of 1 or more, as a host that adjusts each sub-pixel motion needs (BWS
+        // on macOS, CJE PR #67): an answer adjusted again comes back as it is.
+        const auto adjusted = editorWrapper->constrainHostSize({(int)*w, (int)*h});
+        *w = (uint32_t)adjusted.getWidth();
+        *h = (uint32_t)adjusted.getHeight();
         return true;
     }
 
@@ -2375,7 +2571,14 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
             return false;
 
         const auto b = juce::Rectangle{(int)width, (int)height};
+#if JUCE_WINDOWS && JUCE_VERSION >= 0x090000
+        if (guiParentAttached)
+            editorWrapper->takeHostSize(b);
+        else
+            editorWrapper->holdHostSize(b);
+#else
         editorWrapper->setSize(b.getWidth(), b.getHeight());
+#endif
         return true;
     }
 
@@ -2524,7 +2727,7 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
 #endif
 
 #if JUCE_WINDOWS
-    bool guiWin32Attach(clap_hwnd window) const noexcept
+    bool guiWin32Attach(clap_hwnd window) noexcept
     {
         editorWrapper->setVisible(false);
         editorWrapper->setTopLeftPosition(0, 0);
@@ -2541,6 +2744,7 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
             peer->setCustomPlatformScaleFactor(1.0);
             peer->setBounds(editorWrapper->getBounds(), false);
         }
+        editorWrapper->followWindowScale(static_cast<HWND>(window));
 #endif
         editorWrapper->setVisible(true);
         return true;
